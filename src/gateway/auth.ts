@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import type {
   GatewayAuthConfig,
+  GatewayLdapConfig,
   GatewayTailscaleMode,
   GatewayTrustedProxyConfig,
 } from "../config/config.js";
@@ -12,6 +13,8 @@ import {
   type AuthRateLimiter,
   type RateLimitCheckResult,
 } from "./auth-rate-limit.js";
+import { LdapAuthenticator } from "./ad/ldap-auth.js";
+import { samlValidateToken } from "./ad/saml-session-store.js";
 import { resolveGatewayCredentialsFromValues } from "./credentials.js";
 import {
   isLocalishHost,
@@ -21,7 +24,7 @@ import {
   resolveClientIp,
 } from "./net.js";
 
-export type ResolvedGatewayAuthMode = "none" | "token" | "password" | "trusted-proxy";
+export type ResolvedGatewayAuthMode = "none" | "token" | "password" | "trusted-proxy" | "ldap" | "saml";
 export type ResolvedGatewayAuthModeSource =
   | "override"
   | "config"
@@ -36,6 +39,8 @@ export type ResolvedGatewayAuth = {
   password?: string;
   allowTailscale: boolean;
   trustedProxy?: GatewayTrustedProxyConfig;
+  /** Active LDAP authenticator instance. Present only when mode is "ldap". */
+  ldap?: LdapAuthenticator;
 };
 
 export type GatewayAuthResult = {
@@ -47,19 +52,56 @@ export type GatewayAuthResult = {
     | "tailscale"
     | "device-token"
     | "bootstrap-token"
-    | "trusted-proxy";
+    | "trusted-proxy"
+    | "ldap"
+    | "saml";
   user?: string;
   reason?: string;
   /** Present when the request was blocked by the rate limiter. */
   rateLimited?: boolean;
   /** Milliseconds the client should wait before retrying (when rate-limited). */
   retryAfterMs?: number;
+  /**
+   * Role name matched from gateway.roles[] when the request authenticated with
+   * a role-specific token. Undefined when authenticated with the main gateway token.
+   */
+  role?: string;
 };
 
 type ConnectAuth = {
   token?: string;
   password?: string;
 };
+
+/** Parse an HTTP Basic Auth header. Returns undefined when absent or malformed. */
+export function getBasicAuth(
+  req?: IncomingMessage,
+): { username: string; password: string } | undefined {
+  if (!req) {
+    return undefined;
+  }
+  const raw = (req.headers["authorization"] ?? "").trim();
+  if (!raw.toLowerCase().startsWith("basic ")) {
+    return undefined;
+  }
+  const encoded = raw.slice(6).trim();
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encoded, "base64").toString("utf-8");
+  } catch {
+    return undefined;
+  }
+  const colonIdx = decoded.indexOf(":");
+  if (colonIdx < 0) {
+    return undefined;
+  }
+  const username = decoded.slice(0, colonIdx);
+  const password = decoded.slice(colonIdx + 1);
+  if (!username || !password) {
+    return undefined;
+  }
+  return { username, password };
+}
 
 export type GatewayAuthSurface = "http" | "ws-control-ui";
 
@@ -271,6 +313,25 @@ export function resolveGatewayAuth(params: {
     authConfig.allowTailscale ??
     (params.tailscaleMode === "serve" && mode !== "password" && mode !== "trusted-proxy");
 
+  // Build LDAP authenticator when mode is "ldap".
+  let ldap: LdapAuthenticator | undefined;
+  if (mode === "ldap" && authConfig.ldap) {
+    const ldapCfg = authConfig.ldap;
+    const bindDn = resolveSimpleSecretInput(ldapCfg.bindDn, env);
+    const bindPassword = resolveSimpleSecretInput(ldapCfg.bindPassword, env);
+    ldap = new LdapAuthenticator({
+      url: ldapCfg.url,
+      baseDn: ldapCfg.baseDn,
+      bindDn,
+      bindPassword,
+      userSearchFilter: ldapCfg.userSearchFilter,
+      userAttribute: ldapCfg.userAttribute,
+      allowedGroups: ldapCfg.allowedGroups,
+      tlsSkipVerify: ldapCfg.tlsSkipVerify,
+      connectTimeoutMs: ldapCfg.connectTimeoutMs,
+    });
+  }
+
   return {
     mode,
     modeSource,
@@ -278,13 +339,42 @@ export function resolveGatewayAuth(params: {
     password,
     allowTailscale,
     trustedProxy,
+    ldap,
   };
+}
+
+/**
+ * Resolve a SecretInput that can be: undefined, plaintext string, or `${ENV_VAR}` template.
+ * Does NOT support vault/file refs — those require the async secrets subsystem.
+ */
+function resolveSimpleSecretInput(
+  value: import("../config/config.js").SecretInput | undefined,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    const envMatch = /^\$\{([A-Z][A-Z0-9_]{0,127})\}$/.exec(value.trim());
+    if (envMatch) {
+      const v = env[envMatch[1]];
+      return typeof v === "string" && v.trim() ? v.trim() : undefined;
+    }
+    return value.trim() || undefined;
+  }
+  // SecretRef object — not resolvable synchronously; caller must use the secrets subsystem.
+  return undefined;
 }
 
 export function assertGatewayAuthConfigured(
   auth: ResolvedGatewayAuth,
   rawAuthConfig?: GatewayAuthConfig | null,
 ): void {
+  if (auth.mode === "none") {
+    throw new Error(
+      "gateway auth mode=none is not permitted; configure a token or password (set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD)",
+    );
+  }
   if (auth.mode === "token" && !auth.token) {
     if (auth.allowTailscale) {
       return;
@@ -313,6 +403,19 @@ export function assertGatewayAuthConfigured(
     if (!auth.trustedProxy.userHeader || auth.trustedProxy.userHeader.trim() === "") {
       throw new Error(
         "gateway auth mode is trusted-proxy, but trustedProxy.userHeader is empty (set gateway.auth.trustedProxy.userHeader)",
+      );
+    }
+  }
+  if (auth.mode === "ldap" && !auth.ldap) {
+    throw new Error(
+      "gateway auth mode is ldap, but no LDAP config was provided (set gateway.auth.ldap.url and gateway.auth.ldap.baseDn)",
+    );
+  }
+  if (auth.mode === "saml") {
+    // SAML validity is enforced at startup via initSamlProvider; the session store must be active.
+    if (!samlValidateToken) {
+      throw new Error(
+        "gateway auth mode is saml, but SAML provider was not initialized (set gateway.auth.saml)",
       );
     }
   }
@@ -433,6 +536,43 @@ export async function authorizeGatewayConnect(
         user: tailscaleCheck.user.login,
       };
     }
+  }
+
+  // ── LDAP mode ────────────────────────────────────────────────────────────
+  if (auth.mode === "ldap") {
+    if (!auth.ldap) {
+      return { ok: false, reason: "ldap_not_configured" };
+    }
+    const basicAuth = getBasicAuth(req);
+    if (!basicAuth) {
+      // Return 401 with WWW-Authenticate so browsers/curl show a login prompt.
+      return { ok: false, reason: "ldap_credentials_missing" };
+    }
+    const result = await auth.ldap.authenticate(basicAuth.username, basicAuth.password);
+    if (result.ok) {
+      limiter?.reset(ip, rateLimitScope);
+      return { ok: true, method: "ldap", user: result.user };
+    }
+    if (result.reason !== "credentials_missing") {
+      // Count actual wrong credentials against rate limit; skip missing-cred penalty.
+      limiter?.recordFailure(ip, rateLimitScope);
+    }
+    return { ok: false, reason: `ldap_${result.reason}` };
+  }
+
+  // ── SAML mode ─────────────────────────────────────────────────────────────
+  if (auth.mode === "saml") {
+    const bearerToken = connectAuth?.token;
+    if (!bearerToken) {
+      return { ok: false, reason: "saml_token_missing" };
+    }
+    const session = samlValidateToken(bearerToken);
+    if (!session) {
+      limiter?.recordFailure(ip, rateLimitScope);
+      return { ok: false, reason: "saml_token_invalid" };
+    }
+    limiter?.reset(ip, rateLimitScope);
+    return { ok: true, method: "saml", user: session.user };
   }
 
   if (auth.mode === "token") {

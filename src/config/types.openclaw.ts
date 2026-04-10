@@ -1,3 +1,4 @@
+import type { AuditConfig } from "../audit/audit-types.js";
 import type { AcpConfig } from "./types.acp.js";
 import type { AgentBinding, AgentsConfig } from "./types.agents.js";
 import type { ApprovalsConfig } from "./types.approvals.js";
@@ -122,6 +123,27 @@ export type OpenClawConfig = {
   gateway?: GatewayConfig;
   memory?: MemoryConfig;
   mcp?: McpConfig;
+  security?: {
+    promptInjection?: {
+      /**
+       * Enable prompt injection detection and blocking for inbound messages.
+       * Default: true.
+       */
+      enabled?: boolean;
+      /**
+       * Additional regex patterns to detect (case-insensitive, tested against BodyForAgent).
+       * Example: ["mi empresa es legit", "patron personalizado"]
+       */
+      additionalPatterns?: string[];
+    };
+  };
+  /**
+   * Audit log configuration for MSPI Colombia compliance.
+   * When configured, every tool call, security event, and auth attempt is
+   * written to an append-only JSONL file with a SHA-256 hash chain and
+   * optional HMAC-SHA-256 signature per entry.
+   */
+  audit?: AuditConfig;
 };
 
 export type ConfigValidationIssue = {

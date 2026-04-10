@@ -78,6 +78,8 @@ import type { GatewayWsClient } from "./server/ws-types.js";
 import { handleSessionKillHttpRequest } from "./session-kill-http.js";
 import { handleSessionHistoryHttpRequest } from "./sessions-history-http.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
+import { handleSamlHttpRequest } from "./ad/saml-http.js";
+import { getSamlProvider } from "./ad/saml-provider.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 
@@ -812,6 +814,21 @@ export function createGatewayHttpServer(opts: {
         ? resolvePluginRoutePathContext(requestPath)
         : null;
       const requestStages: GatewayHttpRequestStage[] = [
+        // SAML endpoints run before auth — the login/callback paths are public by design.
+        {
+          name: "saml",
+          run: () => {
+            if (resolvedAuth.mode !== "saml") {
+              return Promise.resolve(false);
+            }
+            const provider = getSamlProvider();
+            if (!provider) {
+              return Promise.resolve(false);
+            }
+            const controlUiBase = controlUiEnabled ? controlUiBasePath : "/";
+            return handleSamlHttpRequest(req, res, provider, controlUiBase);
+          },
+        },
         {
           name: "hooks",
           run: () => handleHooksRequest(req, res),

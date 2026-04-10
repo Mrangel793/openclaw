@@ -187,7 +187,13 @@ export async function getReplyFromConfig(
   });
   opts?.onTypingController?.(typing);
 
-  const finalized = finalizeInboundContext(ctx);
+  const finalized = finalizeInboundContext(ctx, {
+    additionalInjectionPatterns: cfg.security?.promptInjection?.additionalPatterns,
+  });
+
+  if (finalized.PromptInjectionBlocked && cfg.security?.promptInjection?.enabled !== false) {
+    return { text: "Tu mensaje no pudo procesarse por contener patrones no permitidos." };
+  }
 
   if (!isFastTestEnv) {
     await applyMediaUnderstandingIfNeeded({

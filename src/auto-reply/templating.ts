@@ -187,6 +187,12 @@ export type FinalizedMsgContext = Omit<MsgContext, "CommandAuthorized"> & {
    * Default-deny: missing/undefined becomes false.
    */
   CommandAuthorized: boolean;
+  /**
+   * Set to true by finalizeInboundContext() when detectPromptInjection()
+   * finds a pattern matching a known injection technique.
+   * Callers should check this flag and reject the message before agent dispatch.
+   */
+  PromptInjectionBlocked?: boolean;
 };
 
 export type TemplateContext = MsgContext & {

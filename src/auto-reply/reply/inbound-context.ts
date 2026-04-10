@@ -1,13 +1,19 @@
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { resolveConversationLabel } from "../../channels/conversation-label.js";
 import type { FinalizedMsgContext, MsgContext } from "../templating.js";
-import { normalizeInboundTextNewlines, sanitizeInboundSystemTags } from "./inbound-text.js";
+import {
+  detectPromptInjection,
+  normalizeInboundTextNewlines,
+  sanitizeInboundSystemTags,
+} from "./inbound-text.js";
 
 export type FinalizeInboundContextOptions = {
   forceBodyForAgent?: boolean;
   forceBodyForCommands?: boolean;
   forceChatType?: boolean;
   forceConversationLabel?: boolean;
+  /** Additional regex patterns (as strings) to test for prompt injection. */
+  additionalInjectionPatterns?: string[];
 };
 
 const DEFAULT_MEDIA_TYPE = "application/octet-stream";
@@ -70,6 +76,14 @@ export function finalizeInboundContext<T extends Record<string, unknown>>(
   normalized.BodyForAgent = sanitizeInboundSystemTags(
     normalizeInboundTextNewlines(bodyForAgentSource),
   );
+
+  const injectionResult = detectPromptInjection(
+    normalized.BodyForAgent,
+    opts.additionalInjectionPatterns,
+  );
+  if (injectionResult.detected) {
+    normalized.PromptInjectionBlocked = true;
+  }
 
   const bodyForCommandsSource = opts.forceBodyForCommands
     ? (normalized.CommandBody ?? normalized.RawBody ?? normalized.Body)

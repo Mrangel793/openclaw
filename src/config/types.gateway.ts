@@ -120,7 +120,111 @@ export type GatewayControlUiConfig = {
   dangerouslyDisableDeviceAuth?: boolean;
 };
 
-export type GatewayAuthMode = "none" | "token" | "password" | "trusted-proxy";
+export type GatewayAuthMode = "none" | "token" | "password" | "trusted-proxy" | "ldap" | "saml";
+
+/**
+ * LDAP / Active Directory authentication configuration.
+ * Required when `gateway.auth.mode` is `"ldap"`.
+ */
+export type GatewayLdapConfig = {
+  /**
+   * LDAP server URL. Use `ldaps://` for LDAPS (recommended for production).
+   * Example: `ldaps://dc01.entidad.gov.co:636`
+   */
+  url: string;
+  /**
+   * Base Distinguished Name for user searches.
+   * Example: `"DC=entidad,DC=gov,DC=co"`
+   */
+  baseDn: string;
+  /**
+   * Service-account DN used to search the directory before verifying user credentials.
+   * Example: `"CN=svc-openclaw,OU=ServiceAccounts,DC=entidad,DC=gov,DC=co"`
+   * When omitted, an anonymous bind is attempted (requires anonymous read access).
+   */
+  bindDn?: SecretInput;
+  /** Service-account password (plaintext or `${ENV_VAR}`). */
+  bindPassword?: SecretInput;
+  /**
+   * LDAP search filter to locate the user entry.
+   * Use `{{username}}` as the placeholder; it will be LDAP-escaped.
+   * Default: `"(sAMAccountName={{username}})"` (standard AD attribute).
+   * For UPN-based login use: `"(userPrincipalName={{username}})"`.
+   */
+  userSearchFilter?: string;
+  /**
+   * Entry attribute used as the canonical user identifier in audit logs and session info.
+   * Default: `"sAMAccountName"`.
+   */
+  userAttribute?: string;
+  /**
+   * Optional allowlist of AD group DNs. The authenticating user must be a member of
+   * at least one of these groups.
+   * Example: `["CN=Funcionarios,OU=Groups,DC=entidad,DC=gov,DC=co"]`
+   */
+  allowedGroups?: string[];
+  /**
+   * Skip TLS certificate validation.
+   * **Do not use in production.** Only for internal test environments with self-signed certs.
+   * Default: false.
+   */
+  tlsSkipVerify?: boolean;
+  /** TCP connection timeout in milliseconds. Default: 5000. */
+  connectTimeoutMs?: number;
+};
+
+/**
+ * SAML 2.0 Service Provider configuration.
+ * Required when `gateway.auth.mode` is `"saml"`.
+ *
+ * Compatible with ADFS, Entra ID (Azure AD), Okta, and any standard SAML 2.0 IdP.
+ */
+export type GatewaySamlConfig = {
+  /**
+   * IdP Single Sign-On URL (HTTP-Redirect binding).
+   * ADFS example: `https://adfs.entidad.gov.co/adfs/ls`
+   * Entra ID example: `https://login.microsoftonline.com/<tenant>/saml2`
+   */
+  idpSsoUrl: string;
+  /**
+   * IdP signing certificate in PEM format (with or without `-----BEGIN CERTIFICATE-----` header).
+   * Obtain this from the IdP's federation metadata or admin console.
+   */
+  idpCert: string;
+  /**
+   * SP Entity ID — must match the identifier configured in the IdP Relying Party Trust.
+   * Convention: use the SP metadata URL.
+   * Example: `https://openclaw.entidad.gov.co/auth/saml/metadata`
+   */
+  spEntityId: string;
+  /**
+   * SP Assertion Consumer Service (ACS) URL — where the IdP will POST the SAMLResponse.
+   * Example: `https://openclaw.entidad.gov.co/auth/saml/callback`
+   */
+  spAcsUrl: string;
+  /**
+   * SAML attribute name that contains the authenticated user identity.
+   * Falls back to `nameID` when absent.
+   * Default: `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`
+   */
+  userAttribute?: string;
+  /**
+   * Optional allowlist of SAML user identities (e.g. emails).
+   * When empty or absent, all users authenticated by the IdP are allowed.
+   */
+  allowUsers?: string[];
+  /**
+   * Session token lifetime in milliseconds.
+   * Default: 28800000 (8 hours).
+   */
+  sessionTtlMs?: number;
+  /**
+   * SP private key (PEM) for signing AuthnRequest messages.
+   * Supports plaintext PEM or `${ENV_VAR}`.
+   * Optional — most IdPs do not require signed requests.
+   */
+  spPrivateKey?: SecretInput;
+};
 
 /**
  * Configuration for trusted reverse proxy authentication.
@@ -163,10 +267,20 @@ export type GatewayAuthConfig = {
    * Required when mode is "trusted-proxy".
    */
   trustedProxy?: GatewayTrustedProxyConfig;
+  /**
+   * LDAP / Active Directory configuration.
+   * Required when mode is "ldap".
+   */
+  ldap?: GatewayLdapConfig;
+  /**
+   * SAML 2.0 Service Provider configuration.
+   * Required when mode is "saml".
+   */
+  saml?: GatewaySamlConfig;
 };
 
 export type GatewayAuthRateLimitConfig = {
-  /** Maximum failed attempts per IP before blocking.  @default 10 */
+  /** Maximum failed attempts per IP before blocking.  @default 5 */
   maxAttempts?: number;
   /** Sliding window duration in milliseconds.  @default 60000 (1 min) */
   windowMs?: number;
@@ -383,11 +497,91 @@ export type GatewayNodesConfig = {
   denyCommands?: string[];
 };
 
+export type GatewaySecurityConfig = {
+  /**
+   * Global WebSocket origin allowlist. When set, any WebSocket connection that
+   * presents an Origin header must match one of the listed origins (exact,
+   * case-insensitive) or be from a local loopback address. Use "*" to allow any
+   * origin. Connections without an Origin header (e.g. native CLI clients) are
+   * not affected by this list.
+   *
+   * Example: ["https://control.empresa.com", "https://app.empresa.com"]
+   */
+  wsOriginAllowlist?: string[];
+};
+
+export type GatewayNetworkPolicy = {
+  /**
+   * Hostnames/patterns allowed for HTTP/HTTPS URLs found in tool call arguments.
+   * Supports exact hosts ("api.empresa.com") and subdomain wildcards ("*.empresa.com").
+   * When defined, any URL not matching the list is blocked with HTTP 403.
+   * If empty or omitted, no URL-based blocking is applied (unless blockExternalUrls is set).
+   */
+  allowedHosts?: string[];
+  /**
+   * When true, block any URL whose hostname resolves to a public (non-private) address.
+   * Only RFC-1918 private ranges (10.x, 172.16-31.x, 192.168.x), loopback, link-local,
+   * and internal hostnames (.local, .internal, localhost) are allowed through.
+   * Use `allowedHosts` to add explicit exceptions for trusted public endpoints.
+   * Default: false.
+   */
+  blockExternalUrls?: boolean;
+};
+
 export type GatewayToolsConfig = {
   /** Tools to deny via gateway HTTP /tools/invoke (extends defaults). */
   deny?: string[];
   /** Tools to explicitly allow (removes from default deny list). */
   allow?: string[];
+  /**
+   * Network policy for tool call argument inspection.
+   * Blocks tool calls that include URLs pointing to hosts outside the allowlist.
+   */
+  networkPolicy?: GatewayNetworkPolicy;
+};
+
+export type GatewayRoleToolsConfig = {
+  /** Tool names allowed for this role (applied after global deny list). */
+  allow?: string[];
+  /** Additional tool names denied for this role. */
+  deny?: string[];
+};
+
+export type GatewayRoleMcpConfig = {
+  /**
+   * MCP server or plugin IDs this role can access.
+   * When set, only tools whose plugin/server ID appears in this list are accessible
+   * for this role. Native (built-in) tools without a plugin ID are not affected.
+   * Supports exact matches (case-insensitive).
+   * Example: ["filesystem", "web-search-plugin"]
+   */
+  allow?: string[];
+  /**
+   * MCP server or plugin IDs blocked for this role.
+   * Applied in addition to the global deny list and any per-role tool deny list.
+   * Example: ["filesystem"]
+   */
+  deny?: string[];
+};
+
+export type GatewayRoleConfig = {
+  /** Identifier for this role (e.g. "admin", "analista", "funcionario"). */
+  name: string;
+  /**
+   * Bearer token that grants this role.
+   * Accepts plaintext strings, `${ENV_VAR}` template syntax, or a SecretRef object.
+   * For env-based refs at gateway bootstrap, prefer `${ENV_VAR}` or
+   * `{ source: "env", provider: "default", id: "MY_ROLE_TOKEN" }`.
+   */
+  token: SecretInput;
+  /** Tool-name–level access restrictions applied to requests with this role's token. */
+  tools?: GatewayRoleToolsConfig;
+  /**
+   * MCP server / plugin–level access restrictions for this role.
+   * Use this to allow or deny entire MCP servers or plugin groups.
+   * Applied in addition to `tools` restrictions.
+   */
+  mcps?: GatewayRoleMcpConfig;
 };
 
 export type GatewayConfig = {
@@ -432,6 +626,20 @@ export type GatewayConfig = {
   allowRealIpFallback?: boolean;
   /** Tool access restrictions for HTTP /tools/invoke endpoint. */
   tools?: GatewayToolsConfig;
+  /**
+   * Role-based access control: multiple tokens, each granting different tool permissions.
+   * Requests authenticated with a role token are subject to that role's tool restrictions.
+   * Requests using the main gateway.auth.token have unrestricted access (admin role).
+   */
+  roles?: GatewayRoleConfig[];
+  /**
+   * Disable installation or updates of skills from ClawHub (third-party marketplace).
+   * When true, only locally-audited skills are allowed.
+   * Default: false.
+   */
+  /** Global WebSocket and connection-level security settings. */
+  security?: GatewaySecurityConfig;
+  disableClawHub?: boolean;
   /**
    * Channel health monitor interval in minutes.
    * Periodically checks channel health and restarts unhealthy channels.

@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { auditLog } from "../audit/audit-log.js";
 import { createOpenClawTools } from "../agents/openclaw-tools.js";
 import { runBeforeToolCallHook } from "../agents/pi-tools.before-tool-call.js";
 import { resolveToolLoopDetectionConfig } from "../agents/pi-tools.js";
@@ -19,22 +20,72 @@ import {
 import { ToolInputError } from "../agents/tools/common.js";
 import { loadConfig } from "../config/config.js";
 import { resolveMainSessionKey } from "../config/sessions.js";
+import type { GatewayRoleConfig } from "../config/types.gateway.js";
+import {
+  coerceSecretRef,
+  normalizeSecretInputString,
+} from "../config/types.secrets.js";
 import { logWarn } from "../logger.js";
 import { isTestDefaultMemorySlotDisabled } from "../plugins/config-state.js";
 import { getPluginToolMeta } from "../plugins/tools.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
 import { DEFAULT_GATEWAY_HTTP_TOOL_DENY } from "../security/dangerous-tools.js";
+import { safeEqualSecret } from "../security/secret-equal.js";
 import { normalizeMessageChannel } from "../utils/message-channel.js";
 import type { AuthRateLimiter } from "./auth-rate-limit.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
+import { runGatewayToolInterceptor } from "./tool-interceptor.js";
 import { authorizeGatewayBearerRequestOrReply } from "./http-auth-helpers.js";
+import { resolveRequestClientIp } from "./net.js";
 import {
   readJsonBodyOrError,
   sendInvalidRequest,
   sendJson,
   sendMethodNotAllowed,
 } from "./http-common.js";
-import { getHeader } from "./http-utils.js";
+import { getBearerToken, getHeader } from "./http-utils.js";
+
+/**
+ * Resolves a role token from a SecretInput value at gateway-bootstrap level.
+ * Supports plaintext strings, `${ENV_VAR}` templates, and env-source SecretRef objects.
+ * Vault and exec-source refs are not supported at this layer.
+ */
+function resolveRoleTokenAtGateway(
+  token: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const plain = normalizeSecretInputString(token);
+  if (plain) {
+    return plain;
+  }
+  const ref = coerceSecretRef(token);
+  if (!ref) {
+    return undefined;
+  }
+  if (ref.source === "env") {
+    const value = env[ref.id];
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  }
+  // file, exec, hcvault: not resolvable synchronously at HTTP request time
+  return undefined;
+}
+
+/**
+ * Finds the first role from gateway.roles[] whose token matches the bearer token.
+ * Handles SecretInput token values (plaintext, env refs).
+ */
+function matchRoleByBearerToken(
+  roles: GatewayRoleConfig[],
+  bearerToken: string,
+): GatewayRoleConfig | undefined {
+  for (const role of roles) {
+    const resolved = resolveRoleTokenAtGateway(role.token);
+    if (resolved && safeEqualSecret(bearerToken, resolved)) {
+      return role;
+    }
+  }
+  return undefined;
+}
 
 const DEFAULT_BODY_BYTES = 2 * 1024 * 1024;
 const MEMORY_TOOL_NAMES = new Set(["memory_search", "memory_get"]);
@@ -155,10 +206,30 @@ export async function handleToolsInvokeHttpRequest(
   }
 
   const cfg = loadConfig();
+
+  // When gateway.roles are configured, check if the bearer token matches a role token.
+  // If so, synthesize auth against that role's resolved token so the shared-secret check
+  // passes. This allows role tokens (including SecretInput refs) to be used in place of
+  // the main gateway token.
+  const preAuthBearerToken =
+    opts.auth.mode === "token" || opts.auth.mode === "none"
+      ? getBearerToken(req)
+      : undefined;
+  const matchedRole = preAuthBearerToken
+    ? matchRoleByBearerToken(cfg.gateway?.roles ?? [], preAuthBearerToken)
+    : undefined;
+  // Use the resolved plaintext token for the downstream auth check.
+  const matchedRoleResolvedToken = matchedRole
+    ? resolveRoleTokenAtGateway(matchedRole.token)
+    : undefined;
+  const effectiveAuth: ResolvedGatewayAuth = matchedRole && matchedRoleResolvedToken
+    ? { ...opts.auth, mode: "token", token: matchedRoleResolvedToken }
+    : opts.auth;
+
   const ok = await authorizeGatewayBearerRequestOrReply({
     req,
     res,
-    auth: opts.auth,
+    auth: effectiveAuth,
     trustedProxies: opts.trustedProxies ?? cfg.gateway?.trustedProxies,
     allowRealIpFallback: opts.allowRealIpFallback ?? cfg.gateway?.allowRealIpFallback,
     rateLimiter: opts.rateLimiter,
@@ -293,6 +364,9 @@ export async function handleToolsInvokeHttpRequest(
     ],
   });
 
+  // matchedRole is already resolved above from the bearer token pre-auth check.
+  const activeRole = matchedRole;
+
   // Gateway HTTP-specific deny list — applies to ALL sessions via HTTP.
   const gatewayToolsCfg = cfg.gateway?.tools;
   const defaultGatewayDeny: string[] = DEFAULT_GATEWAY_HTTP_TOOL_DENY.filter(
@@ -301,11 +375,66 @@ export async function handleToolsInvokeHttpRequest(
   const gatewayDenyNames = defaultGatewayDeny.concat(
     Array.isArray(gatewayToolsCfg?.deny) ? gatewayToolsCfg.deny : [],
   );
+  // Apply role-specific tool deny list on top of the gateway-level deny list.
+  if (activeRole?.tools?.deny?.length) {
+    for (const name of activeRole.tools.deny) {
+      gatewayDenyNames.push(name);
+    }
+  }
   const gatewayDenySet = new Set(gatewayDenyNames);
-  const gatewayFiltered = subagentFiltered.filter((t) => !gatewayDenySet.has(t.name));
+
+  // When a role defines an explicit tool allow list, restrict to only those tools.
+  const roleAllowSet =
+    activeRole?.tools?.allow?.length ? new Set(activeRole.tools.allow) : undefined;
+
+  // MCP server / plugin–level sets for this role.
+  // Matches against getPluginToolMeta(tool).pluginId (case-insensitive).
+  const roleMcpAllowSet = activeRole?.mcps?.allow?.length
+    ? new Set(activeRole.mcps.allow.map((s) => s.trim().toLowerCase()).filter(Boolean))
+    : undefined;
+  const roleMcpDenySet = activeRole?.mcps?.deny?.length
+    ? new Set(activeRole.mcps.deny.map((s) => s.trim().toLowerCase()).filter(Boolean))
+    : undefined;
+
+  const gatewayFiltered = subagentFiltered.filter((t) => {
+    // Tool-name–level filters.
+    if (gatewayDenySet.has(t.name)) return false;
+    if (roleAllowSet !== undefined && !roleAllowSet.has(t.name)) return false;
+
+    // MCP server / plugin–level filters (only applies to plugin tools with metadata).
+    // oxlint-disable-next-line typescript/no-explicit-any
+    const meta = getPluginToolMeta(t as any);
+    if (meta) {
+      const pluginId = meta.pluginId.trim().toLowerCase();
+      if (roleMcpDenySet?.has(pluginId)) return false;
+      if (roleMcpAllowSet !== undefined && !roleMcpAllowSet.has(pluginId)) return false;
+    }
+
+    return true;
+  });
+
+  // Resolve client IP once for audit logging.
+  const clientIp =
+    resolveRequestClientIp(
+      req,
+      opts.trustedProxies ?? cfg.gateway?.trustedProxies,
+      opts.allowRealIpFallback ?? cfg.gateway?.allowRealIpFallback,
+    ) ?? req.socket?.remoteAddress;
+
+  const auditActor = matchedRole?.name ?? "gateway-token";
+  const auditRole = matchedRole?.name;
 
   const tool = gatewayFiltered.find((t) => t.name === toolName);
   if (!tool) {
+    void auditLog({
+      kind: "tool_blocked",
+      actor: auditActor,
+      ip: clientIp,
+      role: auditRole,
+      tool: toolName,
+      session: sessionKey,
+      details: { reason: "tool_not_available" },
+    });
     sendJson(res, 404, {
       ok: false,
       error: { type: "not_found", message: `Tool not available: ${toolName}` },
@@ -321,6 +450,29 @@ export async function handleToolsInvokeHttpRequest(
       action,
       args,
     });
+
+    const interceptorResult = runGatewayToolInterceptor({
+      toolName,
+      toolArgs,
+      networkPolicy: gatewayToolsCfg?.networkPolicy,
+    });
+    if (!interceptorResult.ok) {
+      void auditLog({
+        kind: "tool_blocked",
+        actor: auditActor,
+        ip: clientIp,
+        role: auditRole,
+        tool: toolName,
+        session: sessionKey,
+        details: { reason: "network_policy", blockedUrl: interceptorResult.value },
+      });
+      sendJson(res, 403, {
+        ok: false,
+        error: { type: "blocked", message: interceptorResult.reason },
+      });
+      return true;
+    }
+
     const hookResult = await runBeforeToolCallHook({
       toolName,
       params: toolArgs,
@@ -332,14 +484,34 @@ export async function handleToolsInvokeHttpRequest(
       },
     });
     if (hookResult.blocked) {
+      void auditLog({
+        kind: "tool_blocked",
+        actor: auditActor,
+        ip: clientIp,
+        role: auditRole,
+        tool: toolName,
+        session: sessionKey,
+        details: { reason: "hook_blocked", hookReason: hookResult.reason },
+      });
       sendJson(res, 403, {
         ok: false,
         error: { type: "tool_call_blocked", message: hookResult.reason },
       });
       return true;
     }
+
     // oxlint-disable-next-line typescript/no-explicit-any
     const result = await (tool as any).execute?.(toolCallId, hookResult.params);
+
+    void auditLog({
+      kind: "tool_call",
+      actor: auditActor,
+      ip: clientIp,
+      role: auditRole,
+      tool: toolName,
+      session: sessionKey,
+    });
+
     sendJson(res, 200, { ok: true, result });
   } catch (err) {
     const inputStatus = resolveToolInputErrorStatus(err);

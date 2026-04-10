@@ -1,4 +1,4 @@
-export type SecretRefSource = "env" | "file" | "exec"; // pragma: allowlist secret
+export type SecretRefSource = "env" | "file" | "exec" | "hcvault"; // pragma: allowlist secret
 
 /**
  * Stable identifier for a secret in a configured source.
@@ -6,6 +6,7 @@ export type SecretRefSource = "env" | "file" | "exec"; // pragma: allowlist secr
  * - env source: provider "default", id "OPENAI_API_KEY"
  * - file source: provider "mounted-json", id "/providers/openai/apiKey"
  * - exec source: provider "vault", id "openai/api-key"
+ * - hcvault source: provider "vault", id "openai/production#api_key"
  */
 export type SecretRef = {
   source: SecretRefSource;
@@ -39,7 +40,7 @@ export function isSecretRef(value: unknown): value is SecretRef {
     return false;
   }
   return (
-    (value.source === "env" || value.source === "file" || value.source === "exec") &&
+    (value.source === "env" || value.source === "file" || value.source === "exec" || value.source === "hcvault") &&
     typeof value.provider === "string" &&
     value.provider.trim().length > 0 &&
     typeof value.id === "string" &&
@@ -54,7 +55,7 @@ function isLegacySecretRefWithoutProvider(
     return false;
   }
   return (
-    (value.source === "env" || value.source === "file" || value.source === "exec") &&
+    (value.source === "env" || value.source === "file" || value.source === "exec" || value.source === "hcvault") &&
     typeof value.id === "string" &&
     value.id.trim().length > 0 &&
     value.provider === undefined
@@ -204,10 +205,52 @@ export type ExecSecretProviderConfig = {
   allowSymlinkCommand?: boolean;
 };
 
+export type VaultSecretProviderConfig = {
+  source: "hcvault";
+  /**
+   * HashiCorp Vault server address (e.g. "https://vault.empresa.com:8200").
+   */
+  address: string;
+  /**
+   * Static Vault token. Prefer tokenEnv or tokenPath in production —
+   * a static token in config is stored on disk unencrypted.
+   */
+  token?: string;
+  /**
+   * Environment variable that holds the Vault token.
+   * Defaults to "VAULT_TOKEN" if neither token nor tokenPath is set.
+   */
+  tokenEnv?: string;
+  /**
+   * File path containing the Vault token (e.g. /run/secrets/vault-token).
+   * Suitable for Docker secrets or Kubernetes projected volumes.
+   */
+  tokenPath?: string;
+  /**
+   * Vault namespace (Enterprise only). Sets the X-Vault-Namespace header.
+   */
+  namespace?: string;
+  /**
+   * KV secrets engine version. Default: 2.
+   * v2 uses the /data/ sub-path in API URLs and supports versioning.
+   */
+  kvVersion?: 1 | 2;
+  /**
+   * Mount path for the KV secrets engine. Default: "secret".
+   * Matches the mount you created with `vault secrets enable -path=...`.
+   */
+  mount?: string;
+  /**
+   * Request timeout in milliseconds. Default: 5000.
+   */
+  timeoutMs?: number;
+};
+
 export type SecretProviderConfig =
   | EnvSecretProviderConfig
   | FileSecretProviderConfig
-  | ExecSecretProviderConfig;
+  | ExecSecretProviderConfig
+  | VaultSecretProviderConfig;
 
 export type SecretsConfig = {
   providers?: Record<string, SecretProviderConfig>;

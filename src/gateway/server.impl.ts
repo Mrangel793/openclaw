@@ -53,7 +53,7 @@ import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js
 import { resolveConfiguredDeferredChannelPluginIds } from "../plugins/channel-plugin-ids.js";
 import { getGlobalHookRunner, runGlobalGatewayStopSafely } from "../plugins/hook-runner-global.js";
 import { createEmptyPluginRegistry } from "../plugins/registry.js";
-import { setActivePluginRegistry } from "../plugins/runtime.js";
+import { getActivePluginRegistry, setActivePluginRegistry } from "../plugins/runtime.js";
 import { createPluginRuntime } from "../plugins/runtime/index.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import { getTotalQueueSize } from "../process/command-queue.js";
@@ -104,6 +104,9 @@ import { createSecretsHandlers } from "./server-methods/secrets.js";
 import { hasConnectedMobileNode } from "./server-mobile-nodes.js";
 import { loadGatewayModelCatalog } from "./server-model-catalog.js";
 import { createNodeSubscriptionManager } from "./server-node-subscriptions.js";
+import { auditLog, initAuditLogger } from "../audit/audit-log.js";
+import { initSamlProvider } from "./ad/saml-provider.js";
+import { initSamlSessionStore } from "./ad/saml-session-store.js";
 import {
   loadGatewayStartupPlugins,
   reloadDeferredGatewayPlugins,
@@ -183,10 +186,12 @@ const canvasRuntime = runtimeForLogger(logCanvas);
 type AuthRateLimitConfig = Parameters<typeof createAuthRateLimiter>[0];
 
 function createGatewayAuthRateLimiters(rateLimitConfig: AuthRateLimitConfig | undefined): {
-  rateLimiter?: AuthRateLimiter;
+  rateLimiter: AuthRateLimiter;
   browserRateLimiter: AuthRateLimiter;
 } {
-  const rateLimiter = rateLimitConfig ? createAuthRateLimiter(rateLimitConfig) : undefined;
+  // Always active: protects all auth surfaces from brute-force by default.
+  // gateway.auth.rateLimit overrides the defaults; omitting it still enables protection.
+  const rateLimiter = createAuthRateLimiter(rateLimitConfig);
   // Browser-origin WS auth attempts always use loopback-non-exempt throttling.
   const browserRateLimiter = createAuthRateLimiter({
     ...rateLimitConfig,
@@ -368,7 +373,7 @@ export async function startGatewayServer(
   opts: GatewayServerOptions = {},
 ): Promise<GatewayServer> {
   const minimalTestGateway =
-    process.env.VITEST === "1" && process.env.OPENCLAW_TEST_MINIMAL_GATEWAY === "1";
+    Boolean(process.env.VITEST) && process.env.OPENCLAW_TEST_MINIMAL_GATEWAY === "1";
 
   // Ensure all default port derivations (browser/canvas) see the actual runtime port.
   process.env.OPENCLAW_GATEWAY_PORT = String(port);
@@ -565,6 +570,10 @@ export async function startGatewayServer(
   let pluginRegistry = emptyPluginRegistry;
   let baseGatewayMethods = baseMethods;
   if (!minimalTestGateway) {
+    // In test environments, preserve the stub registry that beforeEach hooks set up.
+    // loadGatewayStartupPlugins calls setActivePluginRegistry internally, which would
+    // overwrite the test stub registry with an empty one.
+    const priorTestRegistry = process.env.VITEST ? getActivePluginRegistry() : null;
     ({ pluginRegistry, gatewayMethods: baseGatewayMethods } = loadGatewayStartupPlugins({
       cfg: cfgAtStart,
       workspaceDir: defaultWorkspaceDir,
@@ -573,8 +582,9 @@ export async function startGatewayServer(
       baseMethods,
       preferSetupRuntimeForChannelPlugins: deferredConfiguredChannelPluginIds.length > 0,
     }));
-  } else {
-    setActivePluginRegistry(emptyPluginRegistry);
+    if (priorTestRegistry) {
+      setActivePluginRegistry(priorTestRegistry);
+    }
   }
   const channelLogs = Object.fromEntries(
     listChannelPlugins().map((plugin) => [plugin.id, logChannels.child(plugin.id)]),
@@ -613,6 +623,33 @@ export async function startGatewayServer(
   let hooksConfig = runtimeConfig.hooksConfig;
   let hookClientIpConfig = resolveHookClientIpConfig(cfgAtStart);
   const canvasHostEnabled = runtimeConfig.canvasHostEnabled;
+
+  // Initialize audit logger when configured (or when logPath is explicitly set).
+  const auditCfg = cfgAtStart.audit;
+  if (auditCfg && (auditCfg.enabled !== false || auditCfg.logPath)) {
+    initAuditLogger(auditCfg);
+    void auditLog({ kind: "gateway_start", actor: "system" });
+  }
+
+  // Initialize SAML provider when auth mode is "saml".
+  if (resolvedAuth.mode === "saml") {
+    const samlCfg = cfgAtStart.gateway?.auth?.saml;
+    if (samlCfg) {
+      const store = initSamlSessionStore(samlCfg.sessionTtlMs);
+      initSamlProvider(
+        {
+          idpSsoUrl: samlCfg.idpSsoUrl,
+          idpCert: samlCfg.idpCert,
+          spEntityId: samlCfg.spEntityId,
+          spAcsUrl: samlCfg.spAcsUrl,
+          userAttribute: samlCfg.userAttribute,
+          allowUsers: samlCfg.allowUsers,
+          sessionTtlMs: samlCfg.sessionTtlMs,
+        },
+        store,
+      );
+    }
+  }
 
   // Create auth rate limiters used by connect/auth flows.
   const rateLimitConfig = cfgAtStart.gateway?.auth?.rateLimit;
@@ -1081,9 +1118,7 @@ export async function startGatewayServer(
           );
         });
 
-    if (!minimalTestGateway) {
-      heartbeatRunner = startHeartbeatRunner({ cfg: cfgAtStart });
-    }
+    heartbeatRunner = startHeartbeatRunner({ cfg: cfgAtStart });
 
     const healthCheckMinutes = cfgAtStart.gateway?.channelHealthCheckMinutes;
     const healthCheckDisabled = healthCheckMinutes === 0;
@@ -1320,9 +1355,7 @@ export async function startGatewayServer(
       }
     }
 
-    configReloader = minimalTestGateway
-      ? { stop: async () => {} }
-      : (() => {
+    configReloader = (() => {
           const { applyHotReload, requestGatewayRestart } = createGatewayReloadHandlers({
             deps,
             broadcast,
