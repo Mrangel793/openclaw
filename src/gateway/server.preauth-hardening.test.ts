@@ -6,7 +6,6 @@ import { MAX_PREAUTH_PAYLOAD_BYTES } from "./server-constants.js";
 import { attachGatewayUpgradeHandler, createGatewayHttpServer } from "./server-http.js";
 import { createPreauthConnectionBudget } from "./server/preauth-connection-budget.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
-import { testState } from "./test-helpers.mocks.js";
 import { createGatewaySuiteHarness, readConnectChallengeNonce } from "./test-helpers.server.js";
 import { withTempConfig } from "./test-temp-config.js";
 
@@ -105,7 +104,7 @@ describe("gateway pre-auth hardening", () => {
     });
 
     const harness = await createGatewaySuiteHarness({
-      serverOptions: { auth: { mode: "none" } },
+      serverOptions: { auth: { mode: "token" as const, token: "test-preauth-token" } },
     });
     try {
       const ws = await harness.openWs();
@@ -169,13 +168,9 @@ describe("gateway pre-auth hardening", () => {
         process.env.OPENCLAW_TEST_MAX_PREAUTH_CONNECTIONS_PER_IP = previous;
       }
     });
-    const previousAuth = testState.gatewayAuth;
-    testState.gatewayAuth = { mode: "none" };
-    cleanupEnv.push(() => {
-      testState.gatewayAuth = previousAuth;
+    const harness = await createGatewaySuiteHarness({
+      serverOptions: { auth: { mode: "token" as const, token: "test-preauth-ip-budget" } },
     });
-
-    const harness = await createGatewaySuiteHarness();
     try {
       const firstWs = await harness.openWs();
       await readConnectChallengeNonce(firstWs);
@@ -221,12 +216,6 @@ describe("gateway pre-auth hardening", () => {
         process.env.OPENCLAW_TEST_MAX_PREAUTH_CONNECTIONS_PER_IP = previous;
       }
     });
-    const previousAuth = testState.gatewayAuth;
-    testState.gatewayAuth = { mode: "none" };
-    cleanupEnv.push(() => {
-      testState.gatewayAuth = previousAuth;
-    });
-
     await withTempConfig({
       cfg: {
         gateway: {
@@ -235,7 +224,9 @@ describe("gateway pre-auth hardening", () => {
       },
       prefix: "openclaw-preauth-proxy-",
       run: async () => {
-        const harness = await createGatewaySuiteHarness();
+        const harness = await createGatewaySuiteHarness({
+          serverOptions: { auth: { mode: "token" as const, token: "test-preauth-ip-proxy-budget" } },
+        });
         try {
           const firstWs = await harness.openWs();
           await readConnectChallengeNonce(firstWs);

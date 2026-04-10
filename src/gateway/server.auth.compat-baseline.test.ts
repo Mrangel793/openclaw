@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
 import {
   BACKEND_GATEWAY_CLIENT,
   connectReq,
@@ -245,31 +245,24 @@ describe("gateway auth compatibility baseline", () => {
   });
 
   describe("none mode", () => {
-    let server: Awaited<ReturnType<typeof startGatewayServer>>;
-    let port = 0;
     let prevToken: string | undefined;
 
-    beforeAll(async () => {
+    beforeEach(() => {
       prevToken = process.env.OPENCLAW_GATEWAY_TOKEN;
       testState.gatewayAuth = { mode: "none" };
       delete process.env.OPENCLAW_GATEWAY_TOKEN;
-      port = await getFreePort();
-      server = await startGatewayServer(port);
     });
 
-    afterAll(async () => {
-      await server.close();
+    afterEach(() => {
       restoreGatewayToken(prevToken);
+      testState.gatewayAuth = undefined;
     });
 
-    test("keeps auth-none loopback behavior unchanged", async () => {
-      const ws = await openWs(port);
-      try {
-        const res = await connectReq(ws, { skipDefaultAuth: true });
-        expect(res.ok).toBe(true);
-      } finally {
-        ws.close();
-      }
+    test("rejects server startup when auth mode is none (CVE-2026-25253)", async () => {
+      const port = await getFreePort();
+      await expect(startGatewayServer(port)).rejects.toThrow(
+        "gateway auth mode=none is not permitted",
+      );
     });
   });
 });

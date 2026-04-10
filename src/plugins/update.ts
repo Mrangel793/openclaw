@@ -313,6 +313,15 @@ export async function updateNpmInstalledPlugins(params: {
       continue;
     }
 
+    if (record.source === "clawhub" && params.config.gateway?.disableClawHub) {
+      outcomes.push({
+        pluginId,
+        status: "skipped",
+        message: `Skipping "${pluginId}" (ClawHub is disabled by gateway.disableClawHub).`,
+      });
+      continue;
+    }
+
     if (record.source === "clawhub" && !record.clawhubPackage) {
       outcomes.push({
         pluginId,

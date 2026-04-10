@@ -43,12 +43,31 @@ function stripProviderPrefix(raw: string, channel: string): string {
 }
 
 function stripKindPrefix(raw: string): string {
-  return raw.replace(/^(user|channel|group|conversation|room|dm):/i, "").trim();
+  return raw.replace(/^(user|channel|group|conversation|room|dm|direct):/i, "").trim();
+}
+
+function parseKindPrefix(target: string): ChatType | undefined {
+  const lower = target.toLowerCase();
+  if (lower.startsWith("channel:")) {
+    return "channel";
+  }
+  if (
+    lower.startsWith("group:") ||
+    lower.startsWith("conversation:") ||
+    lower.startsWith("room:")
+  ) {
+    return "group";
+  }
+  if (lower.startsWith("user:") || lower.startsWith("dm:") || lower.startsWith("direct:")) {
+    return "direct";
+  }
+  return undefined;
 }
 
 function inferPeerKind(params: {
   channel: ChannelId;
   resolvedTarget?: ResolvedMessagingTarget;
+  target?: string;
 }): ChatType {
   const resolvedKind = params.resolvedTarget?.kind;
   if (resolvedKind === "user") {
@@ -66,6 +85,12 @@ function inferPeerKind(params: {
       return "channel";
     }
     return "group";
+  }
+  if (params.target) {
+    const fromPrefix = parseKindPrefix(params.target);
+    if (fromPrefix) {
+      return fromPrefix;
+    }
   }
   return "direct";
 }
@@ -97,6 +122,7 @@ function resolveFallbackSession(
   const peerKind = inferPeerKind({
     channel: params.channel,
     resolvedTarget: params.resolvedTarget,
+    target: trimmed,
   });
   const peerId = stripKindPrefix(trimmed);
   if (!peerId) {

@@ -102,28 +102,24 @@ export function registerAuthModesSuite(): void {
   });
 
   describe("explicit none auth", () => {
-    let server: Awaited<ReturnType<typeof startGatewayServer>>;
-    let port: number;
     let prevToken: string | undefined;
 
-    beforeAll(async () => {
+    beforeEach(() => {
       prevToken = process.env.OPENCLAW_GATEWAY_TOKEN;
       delete process.env.OPENCLAW_GATEWAY_TOKEN;
       testState.gatewayAuth = { mode: "none" };
-      port = await getFreePort();
-      server = await startGatewayServer(port);
     });
 
-    afterAll(async () => {
-      await server.close();
+    afterEach(() => {
       restoreGatewayToken(prevToken);
+      testState.gatewayAuth = undefined;
     });
 
-    test("allows loopback connect without shared secret when mode is none", async () => {
-      const ws = await openWs(port);
-      const res = await connectReq(ws, { skipDefaultAuth: true });
-      expect(res.ok).toBe(true);
-      ws.close();
+    test("rejects server startup when auth mode is none (CVE-2026-25253)", async () => {
+      const port = await getFreePort();
+      await expect(startGatewayServer(port)).rejects.toThrow(
+        "gateway auth mode=none is not permitted",
+      );
     });
   });
 

@@ -127,6 +127,17 @@ export const skillsHandlers: GatewayRequestHandlers = {
     const cfg = loadConfig();
     const workspaceDirRaw = resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg));
     if (params && typeof params === "object" && "source" in params && params.source === "clawhub") {
+      if (cfg.gateway?.disableClawHub) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "ClawHub is disabled (gateway.disableClawHub=true). Only locally-audited skills are allowed.",
+          ),
+        );
+        return;
+      }
       const p = params as {
         source: "clawhub";
         slug: string;
@@ -188,6 +199,18 @@ export const skillsHandlers: GatewayRequestHandlers = {
       return;
     }
     if (params && typeof params === "object" && "source" in params && params.source === "clawhub") {
+      const cfg = loadConfig();
+      if (cfg.gateway?.disableClawHub) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "ClawHub is disabled (gateway.disableClawHub=true). Only locally-audited skills are allowed.",
+          ),
+        );
+        return;
+      }
       const p = params as {
         source: "clawhub";
         slug?: string;
@@ -212,7 +235,6 @@ export const skillsHandlers: GatewayRequestHandlers = {
         );
         return;
       }
-      const cfg = loadConfig();
       const workspaceDir = resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg));
       const results = await updateSkillsFromClawHub({
         workspaceDir,

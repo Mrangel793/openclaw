@@ -21,6 +21,7 @@ function resolveSpeechProviderPluginEntries(cfg?: OpenClawConfig): SpeechProvide
   });
 }
 
+
 function buildProviderMaps(cfg?: OpenClawConfig): {
   canonical: Map<string, SpeechProviderPlugin>;
   aliases: Map<string, SpeechProviderPlugin>;

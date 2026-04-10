@@ -408,6 +408,37 @@ export function attachGatewayWsMessageHandler(params: {
         const isControlUi = isOperatorUiClient(connectParams.client);
         const isBrowserOperatorUi = isBrowserOperatorUiClient(connectParams.client);
         const isWebchat = isWebchatConnect(connectParams);
+
+        // Global WS origin allowlist: when gateway.security.wsOriginAllowlist is set,
+        // any connection that presents an Origin header must match. Connections without
+        // an Origin header (native CLI clients) are not affected.
+        const wsOriginAllowlist = configSnapshot.gateway?.security?.wsOriginAllowlist;
+        if (wsOriginAllowlist && wsOriginAllowlist.length > 0 && requestOrigin) {
+          const wsOriginCheck = checkBrowserOrigin({
+            requestHost,
+            origin: requestOrigin,
+            allowedOrigins: wsOriginAllowlist,
+            allowHostHeaderOriginFallback: false,
+            isLocalClient,
+          });
+          if (!wsOriginCheck.ok) {
+            const errorMessage = "origin not allowed (add it to gateway.security.wsOriginAllowlist)";
+            markHandshakeFailure("origin-mismatch", {
+              origin: requestOrigin ?? "n/a",
+              host: requestHost ?? "n/a",
+              reason: wsOriginCheck.reason,
+            });
+            sendHandshakeErrorResponse(ErrorCodes.INVALID_REQUEST, errorMessage, {
+              details: {
+                code: ConnectErrorDetailCodes.WS_ORIGIN_NOT_ALLOWED,
+                reason: wsOriginCheck.reason,
+              },
+            });
+            close(1008, truncateCloseReason(errorMessage));
+            return;
+          }
+        }
+
         if (enforceOriginCheckForAnyClient || isBrowserOperatorUi || isWebchat) {
           const hostHeaderOriginFallbackEnabled =
             configSnapshot.gateway?.controlUi?.dangerouslyAllowHostHeaderOriginFallback === true;

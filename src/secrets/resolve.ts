@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+
 import type { OpenClawConfig } from "../config/config.js";
 import type {
   ExecSecretProviderConfig,
@@ -8,6 +9,7 @@ import type {
   SecretProviderConfig,
   SecretRef,
   SecretRefSource,
+  VaultSecretProviderConfig,
 } from "../config/types.secrets.js";
 import { inspectPathPermissions, safeStat } from "../security/audit-fs.js";
 import { isPathInside } from "../security/scan-paths.js";
@@ -783,6 +785,247 @@ async function resolveExecRefs(params: {
   return resolved;
 }
 
+const DEFAULT_VAULT_TIMEOUT_MS = 5_000;
+const DEFAULT_VAULT_MOUNT = "secret";
+const DEFAULT_VAULT_TOKEN_ENV = "VAULT_TOKEN";
+
+/**
+ * Parse a vault secret id into its path and optional field components.
+ * Format: "path/to/secret#field_name"
+ * If no "#field" suffix, the field is undefined (whole secret data blob).
+ */
+function parseVaultRefId(id: string): { secretPath: string; field: string | undefined } {
+  const hashIdx = id.indexOf("#");
+  if (hashIdx === -1) {
+    return { secretPath: id, field: undefined };
+  }
+  return { secretPath: id.slice(0, hashIdx), field: id.slice(hashIdx + 1) || undefined };
+}
+
+async function fetchVaultSecret(params: {
+  address: string;
+  token: string;
+  namespace: string | undefined;
+  mount: string;
+  kvVersion: 1 | 2;
+  secretPath: string;
+  timeoutMs: number;
+  providerName: string;
+}): Promise<unknown> {
+  const { address, token, namespace, mount, kvVersion, secretPath, timeoutMs } = params;
+  const normalizedAddress = address.replace(/\/+$/, "");
+  const url =
+    kvVersion === 2
+      ? `${normalizedAddress}/v1/${mount}/data/${secretPath}`
+      : `${normalizedAddress}/v1/${mount}/${secretPath}`;
+
+  const headers: Record<string, string> = {
+    "X-Vault-Token": token,
+  };
+  if (namespace) {
+    headers["X-Vault-Namespace"] = namespace;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(url, { headers, signal: controller.signal });
+  } catch (err) {
+    throw providerResolutionError({
+      source: "hcvault",
+      provider: params.providerName,
+      message: `Vault request failed for path "${secretPath}": ${describeUnknownError(err)}`,
+      cause: err,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    throw providerResolutionError({
+      source: "hcvault",
+      provider: params.providerName,
+      message: `Vault returned HTTP ${response.status} for path "${secretPath}".`,
+    });
+  }
+
+  let json: unknown;
+  try {
+    json = await response.json();
+  } catch (err) {
+    throw providerResolutionError({
+      source: "hcvault",
+      provider: params.providerName,
+      message: `Vault response for path "${secretPath}" is not valid JSON: ${describeUnknownError(err)}`,
+      cause: err,
+    });
+  }
+
+  // KV v2 wraps data under { data: { data: {...} } }; v1 uses { data: {...} }
+  if (!isRecord(json) || !isRecord(json["data"])) {
+    throw providerResolutionError({
+      source: "hcvault",
+      provider: params.providerName,
+      message: `Vault response for path "${secretPath}" has unexpected shape (missing "data").`,
+    });
+  }
+  return kvVersion === 2 ? (json["data"] as Record<string, unknown>)["data"] : json["data"];
+}
+
+async function resolveHcVaultToken(params: {
+  providerConfig: VaultSecretProviderConfig;
+  env: NodeJS.ProcessEnv;
+  providerName: string;
+}): Promise<string> {
+  const { providerConfig, env } = params;
+
+  if (providerConfig.token) {
+    return providerConfig.token;
+  }
+
+  const tokenEnvKey = providerConfig.tokenEnv ?? DEFAULT_VAULT_TOKEN_ENV;
+  const tokenFromEnv = env[tokenEnvKey];
+  if (isNonEmptyString(tokenFromEnv)) {
+    return tokenFromEnv;
+  }
+
+  if (providerConfig.tokenPath) {
+    try {
+      const content = await fs.readFile(providerConfig.tokenPath, "utf8");
+      const trimmed = content.trim();
+      if (trimmed) {
+        return trimmed;
+      }
+      throw providerResolutionError({
+        source: "hcvault",
+        provider: params.providerName,
+        message: `Vault token file "${providerConfig.tokenPath}" is empty.`,
+      });
+    } catch (err) {
+      if (isSecretResolutionError(err)) throw err;
+      throw providerResolutionError({
+        source: "hcvault",
+        provider: params.providerName,
+        message: `Failed to read Vault token from "${providerConfig.tokenPath}": ${describeUnknownError(err)}`,
+        cause: err,
+      });
+    }
+  }
+
+  throw providerResolutionError({
+    source: "hcvault",
+    provider: params.providerName,
+    message: `No Vault token available. Set secrets.providers.${params.providerName}.token, .tokenEnv, or .tokenPath, or set the ${tokenEnvKey} environment variable.`,
+  });
+}
+
+async function resolveHcVaultRefs(params: {
+  refs: SecretRef[];
+  providerName: string;
+  providerConfig: VaultSecretProviderConfig;
+  env: NodeJS.ProcessEnv;
+  cache?: SecretRefResolveCache;
+}): Promise<ProviderResolutionOutput> {
+  const { providerConfig, providerName } = params;
+  const mount = providerConfig.mount ?? DEFAULT_VAULT_MOUNT;
+  const kvVersion = providerConfig.kvVersion ?? 2;
+  const timeoutMs = providerConfig.timeoutMs ?? DEFAULT_VAULT_TIMEOUT_MS;
+
+  const token = await resolveHcVaultToken({
+    providerConfig,
+    env: params.env,
+    providerName,
+  });
+
+  // Group refs by secret path so we fetch each path only once.
+  const pathToRefs = new Map<string, { ref: SecretRef; field: string | undefined }[]>();
+  for (const ref of params.refs) {
+    const { secretPath, field } = parseVaultRefId(ref.id);
+    const group = pathToRefs.get(secretPath) ?? [];
+    group.push({ ref, field });
+    pathToRefs.set(secretPath, group);
+  }
+
+  const resolved = new Map<string, unknown>();
+
+  for (const [secretPath, group] of pathToRefs) {
+    // Use cache keyed by provider+path to avoid redundant HTTP calls.
+    const cacheKey = `hcvault:${providerName}:${secretPath}`;
+    const filePayloadCache = params.cache?.filePayloadByProvider;
+    let dataPromise: Promise<unknown>;
+    if (filePayloadCache) {
+      if (!filePayloadCache.has(cacheKey)) {
+        dataPromise = fetchVaultSecret({
+          address: providerConfig.address,
+          token,
+          namespace: providerConfig.namespace,
+          mount,
+          kvVersion,
+          secretPath,
+          timeoutMs,
+          providerName,
+        });
+        filePayloadCache.set(cacheKey, dataPromise);
+      } else {
+        dataPromise = filePayloadCache.get(cacheKey)!;
+      }
+    } else {
+      dataPromise = fetchVaultSecret({
+        address: providerConfig.address,
+        token,
+        namespace: providerConfig.namespace,
+        mount,
+        kvVersion,
+        secretPath,
+        timeoutMs,
+        providerName,
+      });
+    }
+
+    let data: unknown;
+    try {
+      data = await dataPromise;
+    } catch (err) {
+      if (isSecretResolutionError(err)) throw err;
+      throw providerResolutionError({
+        source: "hcvault",
+        provider: providerName,
+        message: describeUnknownError(err),
+        cause: err,
+      });
+    }
+
+    for (const { ref, field } of group) {
+      if (!field) {
+        // No field: return the entire data object as JSON string.
+        resolved.set(ref.id, isRecord(data) ? JSON.stringify(data) : String(data ?? ""));
+        continue;
+      }
+      if (!isRecord(data) || !(field in data)) {
+        throw refResolutionError({
+          source: "hcvault",
+          provider: providerName,
+          refId: ref.id,
+          message: `Vault secret at "${secretPath}" has no field "${field}".`,
+        });
+      }
+      const value = data[field];
+      if (typeof value !== "string") {
+        throw refResolutionError({
+          source: "hcvault",
+          provider: providerName,
+          refId: ref.id,
+          message: `Vault field "${field}" at "${secretPath}" is not a string (got ${typeof value}).`,
+        });
+      }
+      resolved.set(ref.id, value);
+    }
+  }
+
+  return resolved;
+}
+
 async function resolveProviderRefs(params: {
   refs: SecretRef[];
   source: SecretRefSource;
@@ -815,6 +1058,15 @@ async function resolveProviderRefs(params: {
         providerConfig: params.providerConfig,
         env: params.options.env ?? process.env,
         limits: params.limits,
+      });
+    }
+    if (params.providerConfig.source === "hcvault") {
+      return await resolveHcVaultRefs({
+        refs: params.refs,
+        providerName: params.providerName,
+        providerConfig: params.providerConfig,
+        env: params.options.env ?? process.env,
+        cache: params.options.cache,
       });
     }
     throw providerResolutionError({

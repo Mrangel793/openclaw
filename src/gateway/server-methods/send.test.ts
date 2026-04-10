@@ -489,6 +489,7 @@ describe("gateway send mirroring", () => {
 
   it("derives a target session key when none is provided", async () => {
     mockDeliverySuccess("m3");
+    mocks.resolveOutboundTarget.mockReturnValue({ ok: true, to: "channel:resolved" });
 
     await runSend({
       to: "channel:C1",
@@ -510,6 +511,7 @@ describe("gateway send mirroring", () => {
 
   it("uses explicit agentId for delivery when sessionKey is not provided", async () => {
     mockDeliverySuccess("m-agent");
+    mocks.resolveOutboundTarget.mockReturnValue({ ok: true, to: "channel:resolved" });
 
     await runSend({
       to: "channel:C1",

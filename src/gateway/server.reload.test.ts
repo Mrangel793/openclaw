@@ -161,6 +161,58 @@ vi.mock("./config-reload.js", () => ({
   startGatewayConfigReloader: hoisted.startGatewayConfigReloader,
 }));
 
+// Bundled plugin dist files are not compiled in source-checkout test runs.
+// Provide a minimal fake Gemini provider so web-search key validation works in hot-reload tests.
+vi.mock("../plugins/web-search-providers.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../plugins/web-search-providers.js")>();
+  const fakeGeminiProvider = {
+    pluginId: "google",
+    id: "gemini" as const,
+    label: "Gemini (Google Search)",
+    hint: "test stub",
+    envVars: ["GEMINI_API_KEY"],
+    placeholder: "AIza...",
+    signupUrl: "https://aistudio.google.com/apikey",
+    autoDetectOrder: 20,
+    credentialPath: "tools.web.search.gemini.apiKey",
+    inactiveSecretPaths: ["tools.web.search.gemini.apiKey"],
+    getCredentialValue: (searchConfig?: Record<string, unknown>) => {
+      const gemini = searchConfig?.gemini;
+      return gemini && typeof gemini === "object" && !Array.isArray(gemini)
+        ? (gemini as Record<string, unknown>).apiKey
+        : undefined;
+    },
+    setCredentialValue: (target: Record<string, unknown>, value: unknown) => {
+      const gemini = (target.gemini ?? {}) as Record<string, unknown>;
+      gemini.apiKey = value;
+      target.gemini = gemini;
+    },
+    createTool: () => null,
+  };
+  return {
+    ...actual,
+    resolveBundledPluginWebSearchProviders: (
+      params: Parameters<typeof actual.resolveBundledPluginWebSearchProviders>[0],
+    ): ReturnType<typeof actual.resolveBundledPluginWebSearchProviders> => {
+      let real: ReturnType<typeof actual.resolveBundledPluginWebSearchProviders> = [];
+      try {
+        real = actual.resolveBundledPluginWebSearchProviders(params);
+      } catch {
+        // bundled plugin dist files not compiled in source-checkout test runs
+      }
+      if (real.length > 0) {
+        return real;
+      }
+      // No bundled providers available: return fake Gemini entry so hot-reload key validation runs.
+      const ids = params.onlyPluginIds;
+      if (ids && ids.length > 0 && !ids.includes("google")) {
+        return [];
+      }
+      return [fakeGeminiProvider] as ReturnType<typeof actual.resolveBundledPluginWebSearchProviders>;
+    },
+  };
+});
+
 installGatewayTestHooks({ scope: "suite" });
 
 describe("gateway hot reload", () => {
