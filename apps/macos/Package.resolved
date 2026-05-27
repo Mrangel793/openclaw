@@ -1,5 +1,5 @@
 {
-  "originHash" : "1c9c9d251b760ed3234ecff741a88eb4bf42315ad6f50ac7392b187cf226c16c",
+  "originHash" : "8cbfa1118a229eb76f49a36872bf1872915998ee81edd9f0042e0817a3661539",
   "pins" : [
     {
       "identity" : "axorcist",
@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/orchetect/MenuBarExtraAccess",
       "state" : {
-        "revision" : "707dff6f55217b3ef5b6be84ced3e83511d4df5c",
-        "version" : "1.2.2"
+        "revision" : "33bb0e4b1e407feac791e047dcaaf9c69b25fd26",
+        "version" : "1.3.0"
       }
     },
     {
@@ -78,8 +78,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-log.git",
       "state" : {
-        "revision" : "bbd81b6725ae874c69e9b8c8804d462356b55523",
-        "version" : "1.10.1"
+        "revision" : "a012e0ad8a8a72de92b0e008c81a9b793f70e73a",
+        "version" : "1.12.1"
       }
     },
     {
